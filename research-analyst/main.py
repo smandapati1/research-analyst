@@ -1,24 +1,14 @@
-"""
-Multi-Agent Research Analyst — CLI entry point.
+"""CLI entry point for the Multi-Agent Research Analyst."""
 
-Usage:
-    export ANTHROPIC_API_KEY=your_key_here
-    python main.py "What regulatory catalysts are pushing embodied carbon
-    data into commercial real estate underwriting?"
-
-Runs the query through retrieve -> synthesize -> critique (with bounded
-revision loop) -> finalize, then scores and logs the trace.
-"""
-
+import os
 import sys
 import time
-import os
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from src.retrieval import TfidfRetriever
+from src.eval import log_trace, score_run
 from src.graph import run_query
-from src.eval import score_faithfulness, log_trace
+from src.retrieval import HybridRetriever
 
 CORPUS_DIR = os.path.join(os.path.dirname(__file__), "corpus")
 
@@ -26,28 +16,30 @@ CORPUS_DIR = os.path.join(os.path.dirname(__file__), "corpus")
 def main():
     if len(sys.argv) < 2:
         print('Usage: python main.py "your question here"')
-        sys.exit(1)
-
+        raise SystemExit(1)
     if not os.environ.get("ANTHROPIC_API_KEY"):
         print("ERROR: set ANTHROPIC_API_KEY before running.")
-        sys.exit(1)
+        raise SystemExit(1)
 
     query = sys.argv[1]
-    retriever = TfidfRetriever(CORPUS_DIR)
-
+    retriever = HybridRetriever(CORPUS_DIR)
     start = time.time()
     state = run_query(retriever, query)
     elapsed = time.time() - start
+    metrics = score_run(state)
+    trace_path = log_trace(state, elapsed_seconds=elapsed)
 
-    faithfulness = score_faithfulness(state["final_answer"], state["chunks"])
-    trace_path = log_trace(state, faithfulness, elapsed)
-
-    print("=" * 70)
+    print("=" * 78)
     print(f"QUERY: {query}")
-    print("=" * 70)
-    print(f"\nSTATUS: {state['status']}  |  REVISIONS: {state['revision_count']}  |  "
-          f"FAITHFULNESS: {faithfulness}  |  TIME: {elapsed:.1f}s")
-    print(f"SOURCES USED: {[c.source for c in state['chunks']]}")
+    print("=" * 78)
+    print(f"STATUS: {state['status']} | REVISIONS: {state['revision_count']} | TIME: {elapsed:.1f}s")
+    print(f"FAITHFULNESS: {metrics['faithfulness']} | SOURCE DIVERSITY: {metrics['source_diversity']}")
+    print("\nPLAN:")
+    for i, q in enumerate(state["subquestions"], 1):
+        print(f"  {i}. {q}")
+    print("\nRETRIEVED EVIDENCE:")
+    for c in state["chunks"]:
+        print(f"  - {c.source} ({c.doc_id}) score={c.score:.4f}")
     print("\n--- ANSWER ---\n")
     print(state["final_answer"])
     print(f"\n(full trace logged to {trace_path})")

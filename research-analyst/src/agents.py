@@ -1,85 +1,128 @@
-"""
-Agent definitions for the Multi-Agent Research Analyst.
+"""Specialized LLM agents for planning, writing, review, judging, and editing."""
 
-Three roles, deliberately separated instead of collapsed into one prompt:
+from __future__ import annotations
 
-1. Retrieval agent: pulls relevant chunks from the corpus for a query.
-2. Synthesis agent: writes an answer grounded ONLY in retrieved chunks.
-3. Critique agent: checks the synthesis for unsupported claims and either
-   approves it or sends it back with specific feedback for revision.
-
-The retrieval/synthesis split from a single-agent design was motivated by a
-concrete failure mode: a single agent doing retrieval and synthesis in one
-pass tends to confidently write conclusions from weak or tangential sources,
-because it never has to defend its synthesis to anything. Separating out a
-critique agent forces an explicit check before an answer is finalized.
-"""
-
-import os
 import json
+import os
 from anthropic import Anthropic
 
-MODEL = "claude-sonnet-4-6"
-
+MODEL = os.environ.get("RESEARCH_ANALYST_MODEL", "claude-sonnet-4-6")
 client = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 
 
-def synthesize(query: str, chunks: list) -> str:
+def _text(prompt: str, max_tokens: int = 900) -> str:
+    response = client.messages.create(
+        model=MODEL,
+        max_tokens=max_tokens,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return response.content[0].text.strip()
+
+
+def _json(prompt: str, fallback: dict, max_tokens: int = 700) -> dict:
+    raw = _text(prompt, max_tokens=max_tokens)
+    cleaned = raw.replace("```json", "").replace("```", "").strip()
+    try:
+        value = json.loads(cleaned)
+        return value if isinstance(value, dict) else fallback
+    except json.JSONDecodeError:
+        return {**fallback, "parse_error": raw}
+
+
+def plan_query(query: str) -> dict:
+    return _json(
+        f"""You are the planning agent for a research system.
+Break the user's question into 2-5 retrieval-focused subquestions. Keep them
+specific, non-overlapping, and answerable from documents. Include the original
+question if it already represents an important retrieval angle.
+
+Question: {query}
+
+Return ONLY JSON:
+{{"subquestions": ["..."], "reasoning_summary": "one concise sentence"}}""",
+        {"subquestions": [query], "reasoning_summary": "Fallback to the original question."},
+        max_tokens=450,
+    )
+
+
+def synthesize(query: str, chunks: list, feedback: str = "") -> str:
     context = "\n\n---\n\n".join(f"[{c.source}]\n{c.text}" for c in chunks)
-    prompt = f"""You are a research analyst. Answer the question using ONLY the
-context provided below. Every claim must be traceable to a specific source.
-Cite sources inline using the format [source_filename].
+    revision = f"\nReviewer instructions from the previous round:\n{feedback}\n" if feedback else ""
+    return _text(
+        f"""You are the writer agent in a research-analysis pipeline.
+Answer using ONLY the evidence below. Every factual claim must have an inline
+citation in the format [source_filename]. Do not cite a source unless that
+source actually supports the claim. Explicitly state evidence gaps instead of
+using outside knowledge. Prefer synthesis across multiple independent sources
+when the evidence supports it.{revision}
 
-If the context does not contain enough information to answer fully, say so
-explicitly rather than filling gaps with outside knowledge.
-
-Context:
+Evidence:
 {context}
 
 Question: {query}
 
-Answer:"""
-
-    response = client.messages.create(
-        model=MODEL,
-        max_tokens=800,
-        messages=[{"role": "user", "content": prompt}],
+Answer:""",
+        max_tokens=1000,
     )
-    return response.content[0].text
 
 
 def critique(query: str, chunks: list, draft_answer: str) -> dict:
     context = "\n\n---\n\n".join(f"[{c.source}]\n{c.text}" for c in chunks)
-    prompt = f"""You are a critical reviewer checking a draft research answer
-for faithfulness to its sources. You are skeptical by default: your job is to
-find problems, not to rubber-stamp the draft.
+    return _json(
+        f"""You are the skeptical reviewer. Review the draft against the evidence.
+Check for unsupported claims, overreach, wrong citations, missed contradictions,
+and failure to acknowledge insufficient evidence.
 
-Context the draft was supposed to be grounded in:
-{context}
+Evidence:\n{context}\n\nQuestion: {query}\n\nDraft:\n{draft_answer}
 
-Original question: {query}
-
-Draft answer to review:
-{draft_answer}
-
-Check for:
-1. Any claim in the draft NOT supported by the context (fabrication or overreach)
-2. Any citation that misattributes a claim to the wrong source
-3. Whether the draft acknowledges gaps where the context is insufficient
-
-Respond ONLY with valid JSON in this exact format, no other text:
-{{"approved": true or false, "issues": ["issue 1", "issue 2"], "feedback": "specific instructions for revision, or empty string if approved"}}"""
-
-    response = client.messages.create(
-        model=MODEL,
-        max_tokens=500,
-        messages=[{"role": "user", "content": prompt}],
+Return ONLY JSON:
+{{"approved": true, "issues": [], "feedback": ""}}
+or
+{{"approved": false, "issues": ["specific issue"], "feedback": "specific revision instructions"}}""",
+        {"approved": False, "issues": ["critique_parse_error"], "feedback": "Critique could not be parsed; revise conservatively."},
     )
-    raw = response.content[0].text.strip()
-    # Strip markdown code fences if the model wraps the JSON in them
-    raw = raw.replace("```json", "").replace("```", "").strip()
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        # Fail safe: if critique parsing breaks, don't silently approve
-        return {"approved": False, "issues": ["critique_parse_error"], "feedback": raw}
+
+
+def fact_check(query: str, chunks: list, draft_answer: str, citation_analysis: dict) -> dict:
+    context = "\n\n---\n\n".join(f"[{c.source}]\n{c.text}" for c in chunks)
+    return _json(
+        f"""You are an independent fact-checking agent. Verify the draft line by line
+against ONLY the supplied evidence. The deterministic citation checker reported:
+{json.dumps(citation_analysis)}
+
+Evidence:\n{context}\n\nQuestion: {query}\n\nDraft:\n{draft_answer}
+
+Return ONLY JSON:
+{{"passed": true, "unsupported_claims": [], "citation_errors": [], "feedback": ""}}
+or the same object with passed=false and precise problems.""",
+        {"passed": False, "unsupported_claims": ["fact_check_parse_error"], "citation_errors": [], "feedback": "Fact check could not be parsed."},
+    )
+
+
+def judge(query: str, critique_result: dict, fact_check_result: dict, citation_analysis: dict) -> dict:
+    return _json(
+        f"""You are the final quality judge. Decide whether the draft can be accepted,
+needs revision, or should be rejected because the evidence is insufficient.
+Do not override concrete citation or factual failures.
+
+Question: {query}
+Critique: {json.dumps(critique_result)}
+Fact check: {json.dumps(fact_check_result)}
+Citation analysis: {json.dumps(citation_analysis)}
+
+Return ONLY JSON:
+{{"decision": "accept|revise|reject", "reason": "concise reason"}}""",
+        {"decision": "revise", "reason": "Judge response could not be parsed."},
+        max_tokens=350,
+    )
+
+
+def final_edit(query: str, answer: str) -> str:
+    return _text(
+        f"""You are the final editor. Improve clarity and organization of the approved
+answer without adding, deleting, moving, or changing any source citation and
+without introducing any new factual claim. Preserve uncertainty language.
+
+Question: {query}\n\nApproved answer:\n{answer}\n\nEdited answer:""",
+        max_tokens=1000,
+    )

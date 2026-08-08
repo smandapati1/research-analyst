@@ -1,72 +1,49 @@
 # Multi-Agent Research Analyst
 
-A LangGraph-orchestrated research pipeline with three specialized agents
-(retrieval, synthesis, critique) instead of a single monolithic prompt, plus
-a self-built evaluation and tracing layer.
-
-## Why split into three agents instead of one prompt?
-
-A single agent doing retrieval and synthesis in one pass tends to confidently
-write conclusions from weak or tangential sources, because it never has to
-defend its answer to anything. Separating out a dedicated **critique agent**
-forces an explicit check before an answer is finalized: it re-reads the draft
-against the original source chunks, looking specifically for unsupported
-claims and citation errors, and can send the draft back for revision with
-concrete feedback. This is closer to how a human research team catches its
-own mistakes than a single writer editing their own work.
+A LangGraph-orchestrated research system that plans a question, retrieves evidence with a hybrid lexical retriever, writes a grounded answer, critiques it, fact-checks it, and sends it through an independent judge before final editing.
 
 ## Architecture
 
+```text
+question
+  ↓
+planner
+  ↓
+parallel multi-query retrieval
+(BM25 + word TF-IDF + char n-grams + RRF)
+  ↓
+evidence consolidation
+  ↓
+writer
+  ↓
+skeptical critic
+  ↓
+fact checker + deterministic citation checks
+  ↓
+judge
+  ├─ accept → final editor → approved
+  ├─ revise → writer (bounded loop)
+  └─ reject → rejected
 ```
-retrieve -> synthesize -> critique --(approved)--> finalize
-                ^              |
-                |     (rejected, revisions < 2)
-                +--------------+
-```
 
-- **Retrieval** (`src/retrieval.py`): TF-IDF vector search over a local
-  markdown corpus. Chosen over an embedding API for this build to keep the
-  project runnable without extra API keys or vector DB infrastructure — the
-  retriever interface (`.retrieve(query, k)`) is designed so it can be
-  swapped for a proper embedding-based retriever (OpenAI, Voyage,
-  sentence-transformers + a vector store) without touching the graph.
+The revision loop is capped at two passes. If the system still cannot clear the quality gates, the result is marked `unresolved` instead of being silently presented as verified.
 
-- **Synthesis agent** (`src/agents.py::synthesize`): writes an answer
-  grounded only in retrieved chunks, with inline citations. On a revision
-  pass, it receives the critique agent's specific feedback appended to the
-  query.
+## What changed from the original version
 
-- **Critique agent** (`src/agents.py::critique`): reviews the draft against
-  the source chunks for fabricated claims, wrong citations, and
-  unacknowledged gaps in the source material. Returns structured JSON
-  (`approved`, `issues`, `feedback`) so the graph can route on it
-  programmatically.
+- **Hybrid retrieval:** BM25, word-level TF-IDF, and character n-gram TF-IDF are independently ranked and fused with Reciprocal Rank Fusion.
+- **Query planning:** a planner decomposes broad questions into focused retrieval subquestions.
+- **Multi-query research:** evidence is retrieved per subquestion, deduplicated, scored, and consolidated before writing.
+- **Deterministic citation verification:** invalid citations and sentence-level citation coverage are measured without relying on an LLM.
+- **Independent fact-checker:** a second reviewer checks claims against retrieved evidence.
+- **Independent judge:** critique, fact-check, and citation results are evaluated before a draft can be accepted.
+- **Final-editor gate:** editing only happens after approval, reducing the risk that fluent rewriting hides verification failures.
+- **Richer traces:** plans, per-retriever scores, critique/fact-check/judge histories, citation analysis, and run metrics are logged.
 
-- **Orchestration** (`src/graph.py`): a `LangGraph` `StateGraph` wiring the
-  above into a bounded revision loop (max 2 revisions) so a stubborn
-  disagreement between synthesis and critique can't loop forever. If the
-  loop exhausts revisions without approval, the run is finalized as
-  `"unresolved"` rather than silently shipped as if it passed review.
+## Why the retriever is still local
 
-- **Evaluation & tracing** (`src/eval.py`): scores each run for
-  faithfulness (fraction of output sentences with a valid source citation)
-  and logs a full JSON trace of the run — query, sources retrieved, every
-  critique round, and timing — to `traces/`. This is what actually changed
-  my prompts during development: it surfaced a specific failure mode where
-  the synthesis agent would cite correctly in the first sentence and then
-  drop citations on later sentences, which spot-checking outputs never
-  caught.
+This repository intentionally keeps retrieval runnable without a second hosted API or vector database. The `HybridRetriever.retrieve(query, k)` interface is narrow enough to replace later with OpenAI/Voyage embeddings, sentence-transformers, FAISS, Pinecone, or another vector store without rewriting the graph.
 
-## Honest scope note
-
-This is a rebuilt, scoped-down version of a project I originally built and
-demoed. It uses a local TF-IDF retriever and a self-built evaluation layer
-instead of a hosted embedding API and Ragas/LangSmith, so it runs end-to-end
-with just an Anthropic API key and no other account setup. The architecture
-and the design reasoning are the same; the infrastructure choices are
-lighter-weight for portability.
-
-## Running it
+## Run
 
 ```bash
 pip install -r requirements.txt
@@ -74,15 +51,29 @@ export ANTHROPIC_API_KEY=your_key_here
 python main.py "What regulatory catalysts are pushing embodied carbon data into commercial real estate underwriting?"
 ```
 
-Output includes the final answer, faithfulness score, number of revision
-rounds, sources used, and a path to the full JSON trace of the run.
+PowerShell:
 
-## Tested components
+```powershell
+$env:ANTHROPIC_API_KEY="your_key_here"
+python main.py "What regulatory catalysts are pushing embodied carbon data into commercial real estate underwriting?"
+```
 
-Both the retrieval layer and the full graph orchestration (retrieve →
-synthesize → critique → revise → finalize) were tested independently:
-retrieval was verified to surface the correct source chunks for a sample
-query, and the graph was tested with mocked agent responses to confirm the
-critique-driven revision loop correctly routes a rejected draft back to
-synthesis with feedback, then approves and finalizes the revised draft. See
-`tests/test_graph.py`.
+## Test
+
+```bash
+python -m pytest -q
+```
+
+The tests mock LLM calls, so the graph routing tests do not spend API credits or require an Anthropic key.
+
+## Project layout
+
+```text
+src/
+  agents.py      # planner, writer, critic, fact-checker, judge, editor
+  retrieval.py   # BM25 + TF-IDF hybrid retrieval
+  research.py    # multi-query retrieval + deduplication
+  evidence.py    # deterministic citation analysis
+  graph.py       # LangGraph orchestration and revision routing
+  eval.py        # metrics and JSON traces
+```
